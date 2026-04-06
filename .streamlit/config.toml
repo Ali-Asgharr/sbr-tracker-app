@@ -1,0 +1,4 @@
+# .streamlit/config.toml  (in your repo root)
+[server]
+maxUploadSize = 500
+maxMessageSize = 500
