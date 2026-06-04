@@ -835,10 +835,37 @@ def run_phase4(tracker_bytes, doclog_bytes, log):
         # Only mark PENDING SBR if SOL date falls within current month + next 2 months
         if ak30 is not None and window_start <= ak30 <= window_end:
             ws.cell(row=r, column=CAM).value = "PENDING SBR"
-            zv30 = ws.cell(row=r, column=CZ).value
-            nz = (str(zv30).strip() + " & " + str(af30).strip()
-                  if normalize(zv30) and contains_eob(zv30) else str(af30).strip())
-            ws.cell(row=r, column=CZ).value = nz
+            #zv30 = ws.cell(row=r, column=CZ).value
+            #nz = (str(zv30).strip() + " & " + str(af30).strip()
+            #      if normalize(zv30) and contains_eob(zv30) else str(af30).strip())
+            #ws.cell(row=r, column=CZ).value = nz
+            existing_response = str(ws.cell(row=r, column=CZ).value or "").strip()
+            new_response = str(af30).strip()
+
+            if not existing_response:
+                final_response = new_response
+
+            else:
+
+                parts = [p.strip() for p in existing_response.split("&") if p.strip()]
+
+                #Response already exists
+                if any(normalize(p) == normalize(new_response) for p in parts):
+                    final_response = existing_response
+
+                # Payment only -> keep payment and add new response
+                elif len(parts) == 1 and normalize(parts[0]) == "payment":
+                    final_response = f"{parts[0]} & {new_response}"
+
+                # Payment + something -> keep payment and replace second part
+                elif normalize(parts[0]) == "payment":
+                    final_response = f"{parts[0]} & {new_response}"
+
+                # Everything else -> overwrite completely
+                else:
+                    final_response = new_response
+
+            ws.cell(row=r, column=CZ).value = final_response
 
     log_line(log, f"✓ Steps 26-28: Z updated={s26+s27}, AD set={s28}", "ok")
     log_line(log, f"✓ Step 29: PENDING SBR set={s29} · Manual Review (out-of-window)={s29_manual} · No date={s29n}", "ok")
