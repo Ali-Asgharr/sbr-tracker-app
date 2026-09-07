@@ -696,6 +696,50 @@ def run_phase3(tracker_bytes, payment_bytes, log):
     return buf.read(), {"matched":matched,"updated":updated,"already_yes":ay,"not_found":nf}
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# DOC-LOG COLUMN RESOLUTION
+# ─────────────────────────────────────────────────────────────────────────────
+# The Doc-Log columns used to be picked by fixed position (cols[6], cols[8],
+# cols[19]). That breaks silently the moment the export gains or loses a column:
+# everything shifts one place and cols[19] lands on 'ICN/DCN' instead of
+# 'Date Issued'. Claim numbers in ICN/DCN look like '4A250104HTK-0001', and
+# pandas reads the trailing '-0001' as a timezone offset — which is where the
+# "Mixed timezones detected" failure came from.
+#
+# Columns are now resolved by NAME, with the old positions kept only as a
+# last-resort fallback for older exports.
+
+DOCLOG_STUDY_ID_NAMES = ['STUDY_ID', 'Study_Id', 'Study Id', 'StudyId', 'Study ID']
+DOCLOG_SUBTYPE_NAMES  = ['DocumentSubType', 'Document Sub Type', 'Document_Sub_Type',
+                         'DocumentSubtype', 'Document SubType']
+DOCLOG_DATE_NAMES     = ['Date Issued', 'DateIssued', 'Date_Issued', 'DATE ISSUED']
+
+# If fewer than this share of the date column parses as a real date, we assume
+# the wrong column was picked up and stop rather than silently producing an
+# empty lookup.
+DOCLOG_MIN_PARSE_RATIO = 0.5
+
+
+def _pick_doclog_col(cols, wanted_names, fallback_idx, label, log):
+    """Find a Doc-Log column by name; fall back to the legacy fixed position."""
+    lookup = {str(c).strip().lower(): c for c in cols}
+    for w in wanted_names:
+        hit = lookup.get(w.strip().lower())
+        if hit is not None:
+            return hit
+
+    if fallback_idx < len(cols):
+        log_line(log, f"⚠ Doc-Log column '{label}' not found by name — "
+                      f"falling back to position {fallback_idx} ('{cols[fallback_idx]}')", "warn")
+        return cols[fallback_idx]
+
+    raise ValueError(
+        f"Doc-Log column '{label}' not found by name, and fallback position "
+        f"{fallback_idx} is out of range (file has {len(cols)} columns). "
+        f"Check the Doc-Log export layout."
+    )
+
+
 def build_doclog_lookup(doclog_bytes, log):
     try:
         df = pd.read_csv(io.BytesIO(doclog_bytes), low_memory=False)
@@ -703,13 +747,48 @@ def build_doclog_lookup(doclog_bytes, log):
     except Exception:
         df = pd.read_excel(io.BytesIO(doclog_bytes))
         log_line(log, f"✓ Doc-Log loaded · Excel · {len(df):,} rows", "ok")
-    cols=list(df.columns); csid=cols[6]; csub=cols[8]; cdt=cols[19]
-    df[csid]=df[csid].astype(str).str.strip()
-    df[cdt]=pd.to_datetime(df[cdt],format='mixed',dayfirst=False,errors='coerce')
-    valid=df.dropna(subset=[cdt]); mi=valid.groupby(csid)[cdt].idxmax(); dd=df.loc[mi]
-    idx=dd.set_index(csid)
-    afl=idx[csub].to_dict(); adt=idx[cdt].to_dict()
-    adl={k: v.date() if pd.notna(v) else None for k,v in adt.items()}
+
+    cols = list(df.columns)
+    csid = _pick_doclog_col(cols, DOCLOG_STUDY_ID_NAMES, 6,  'STUDY_ID',        log)
+    csub = _pick_doclog_col(cols, DOCLOG_SUBTYPE_NAMES,  8,  'DocumentSubType', log)
+    cdt  = _pick_doclog_col(cols, DOCLOG_DATE_NAMES,     19, 'Date Issued',     log)
+    log_line(log, f"→ Doc-Log columns resolved · ID='{csid}' · SubType='{csub}' · Date='{cdt}'", "info")
+
+    df[csid] = df[csid].astype(str).str.strip()
+
+    try:
+        df[cdt] = pd.to_datetime(df[cdt], format='mixed', dayfirst=False, errors='coerce')
+    except Exception as e:
+        raise ValueError(
+            f"Doc-Log date column '{cdt}' could not be parsed as dates ({e}). "
+            f"This usually means the wrong column was picked up — check that the "
+            f"Doc-Log export still contains a 'Date Issued' column."
+        ) from e
+
+    # Sanity check: if almost nothing parsed, we are reading the wrong column.
+    total  = len(df)
+    parsed = int(df[cdt].notna().sum())
+    if total and (parsed / total) < DOCLOG_MIN_PARSE_RATIO:
+        raise ValueError(
+            f"Doc-Log date column '{cdt}' parsed only {parsed:,} of {total:,} values "
+            f"({parsed / total:.0%}). The wrong column was almost certainly picked up — "
+            f"check the Doc-Log export layout."
+        )
+    if parsed < total:
+        log_line(log, f"→ Doc-Log dates parsed · {parsed:,}/{total:,} "
+                      f"({total - parsed:,} blank or invalid)", "info")
+
+    valid = df.dropna(subset=[cdt])
+    if valid.empty:
+        raise ValueError(
+            f"Doc-Log date column '{cdt}' contains no usable dates — "
+            f"nothing to build a lookup from."
+        )
+
+    mi = valid.groupby(csid)[cdt].idxmax(); dd = df.loc[mi]
+    idx = dd.set_index(csid)
+    afl = idx[csub].to_dict(); adt = idx[cdt].to_dict()
+    adl = {k: v.date() if pd.notna(v) else None for k, v in adt.items()}
     log_line(log, f"✓ Doc-Log lookup · {len(afl):,} unique Study IDs", "ok")
     return afl, adt, adl
 
